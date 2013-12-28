@@ -1,16 +1,21 @@
-import cv, cv2
-
 import time
 import numpy
 import math
+import random
+import copy
+import serial
+from bisect import bisect_right
 
-from structs import Box, Vertex
+import cv, cv2
+
+from structs import Box, Vertex, Frame, Scan
 
 SQRT_2 = math.sqrt(2.0)
 DEBUG = True
 
+
 class Scanner(object):
-	def __init__(self, laser_threshold=20, rotation_step=0.00314159265 * 30, camera_index=0, scale=.1, view_angle_y=0.785):
+	def __init__(self, laser_threshold=200, detection='white', rotation_step=0.00314159265*40, camera_index=0, scale=.1, view_angle_y=0.785):
 		self.calibration = None
 		self.area = None
 		self.mode = None
@@ -26,10 +31,14 @@ class Scanner(object):
 		self.view_angle_y = view_angle_y
 
 		self.frame = None
+		self.last_raw_points = None
 		self.laser_threshold = laser_threshold
 		self.thresholded = None
+		self.detection = detection
 		self.display_image = None
-		self.processed_frames = []
+
+		# Start numbering vertices at 3, to allow for the bottom and top center points
+		self.processed_frames = Scan(vertex_index=3)
 		self.start_bottom_vertex = Vertex(0, 99999, 0)
 		self.start_top_vertex = Vertex(0, -99999, 0)
 
@@ -37,6 +46,25 @@ class Scanner(object):
 		self.window_name = "ui"
 		cv2.namedWindow(self.window_name)
 		cv2.setMouseCallback(self.window_name, self.handle_mouse)
+
+		# Arduino connection
+		try:
+			self.ser = serial.Serial('/dev/tty.usbmodem1411', 9600, timeout=1)
+		except OSError:
+			print "Couldn't establish serial connection"
+			self.ser = None
+
+	def send_command(self, command):
+		""" Send serial command to arduino """
+		if not self.ser:
+			return []
+
+		retval = []
+		self.ser.write(command)
+		retval.append(self.ser.readline().strip())
+		while self.ser.inWaiting():
+			retval.append(self.ser.readline().strip())
+		return retval
 
 	def calibrate(self, x=None):
 		self.record_frame()
@@ -67,6 +95,8 @@ class Scanner(object):
 			self.mode = 'scan'
 		elif k == 27:
 			self.keep_running = False
+		elif k == 105: # 'i' for info
+			print self.send_command('d')
 
 	def record_frame(self):
 		self.frame = cv2.imread("sketch1_laser.png")
@@ -74,10 +104,14 @@ class Scanner(object):
 		self.display_image = self.frame
 
 		blue, green, red = cv2.split(self.frame)
-		red = red - cv2.min(red, blue)
-		red = red - cv2.min(red, green)
+		if self.detection == 'red':
+			red = red - cv2.min(red, blue)
+			red = red - cv2.min(red, green)
+			to_threshold = red
+		else:
+			to_threshold = blue/3+green/3+red/3
 
-		retval, self.thresholded = cv2.threshold(red, self.laser_threshold, 255, cv2.THRESH_BINARY)
+		retval, self.thresholded = cv2.threshold(to_threshold, self.laser_threshold, 255, cv2.THRESH_BINARY)
 
 	def process_frame(self):
 		area = self.thresholded[self.area.y1:self.area.y2, self.area.x1:self.area.x2] if self.area else self.thresholded
@@ -86,13 +120,24 @@ class Scanner(object):
 			cv2.namedWindow("test")
 			cv2.imshow("test", area)
 
-		processed_frame = []
+		processed_frame = Frame()
 		points = numpy.transpose(area.nonzero())
 
-		if len(points) < 2:
-			self.processed_frames.append([])
-			return
+		# Test empty frames
+		# if random.random() < 0.05:
+		# 	points = []
 
+		# If a frame is completely empty, use the last one
+		# FIXME: This is at least bad because it doesn't interpolate between frames before and after a gap
+		# But because this is happening online, the frames after the gap aren't known yet, so it stays like this for now
+		if len(points) < 2:
+			if self.last_raw_points is not None:
+				points = self.last_raw_points
+			else:
+				print "no data in first frame(s)!"
+				return
+
+		self.last_raw_points = points
 		row = points[0][0]
 		row_medians = {row:0}
 		num_row_points = {row:0}
@@ -101,9 +146,16 @@ class Scanner(object):
 			row_medians[y] = row_medians.setdefault(y, 0) + x
 			num_row_points[y] = num_row_points.setdefault(y, 0) + 1
 
-		for point in row_medians.items():
+		last_point = None
+		last_vertex = None
+
+		row_median_list = sorted(row_medians.items(), key = lambda p: p[0])
+		for point in row_median_list:
+			# Test frames with different amounts of vertices
+			# if random.random() < 0.05:
+			# 	continue
 			img_y, img_x = point
-			# Average division happening here to save a loop
+			# Average division for x coordinates in row happening here to save a loop
 			img_x = float(img_x)/num_row_points[img_y] 
 
 			if self.area:
@@ -119,12 +171,27 @@ class Scanner(object):
 			y_from_middle = img_y - half_height
 			alpha = math.atan((y_from_middle/half_height) * self.view_angle_y/2)
 
-			x = math.cos(self.rotation_angle) * d
-			y = self.height - math.sin(alpha)/math.sin(self.view_angle_y/2) * half_height
-			z = math.sin(self.rotation_angle) * d
-			processed_frame.append(Vertex(x*self.scale,y*self.scale,z*self.scale))
-			
-		processed_frame = sorted(processed_frame, key = lambda v: v.y)
+			x = math.cos(self.rotation_angle) * d * self.scale
+			y = self.height - math.sin(alpha)/math.sin(self.view_angle_y/2) * half_height * self.scale
+			z = math.sin(self.rotation_angle) * d * self.scale
+
+			# If some (image) y coordinates didn't contain any data, interpolate their values
+			# FIXME: This is quite naive, it doesn't allow for holes or other complex geometries
+			if last_point and last_point[0] < img_y - 1:
+				d_img_y = last_point[0] + 1
+				total_diff = img_y - last_point[0]
+				while d_img_y < img_y:
+					dx = (float(img_y - d_img_y)/total_diff) * last_vertex.x + (float(d_img_y-last_point[0])/total_diff) * x
+					dy = (float(img_y - d_img_y)/total_diff) * last_vertex.y + (float(d_img_y-last_point[0])/total_diff) * y
+					dz = (float(img_y - d_img_y)/total_diff) * last_vertex.z + (float(d_img_y-last_point[0])/total_diff) * z
+					processed_frame.append(Vertex(dx, dy, dz))
+					d_img_y += 1
+
+			vertex = Vertex(x, y, z)
+			processed_frame.append(vertex)
+			last_point = img_y, img_x
+			last_vertex = vertex
+
 		self.processed_frames.append(processed_frame)
 
 		# Update top and bottom center points
@@ -132,7 +199,6 @@ class Scanner(object):
 			self.start_bottom_vertex = Vertex(0, processed_frame[0].y, 0)
 		if processed_frame[-1].y > self.start_top_vertex.y:
 			self.start_top_vertex = Vertex(0, processed_frame[-1].y, 0)
-
 
 	def display_frame(self):
 		if self.calibration:
@@ -147,6 +213,7 @@ class Scanner(object):
 
 	def rotate(self):
 		self.rotation_angle += self.rotation_step
+		print self.send_command('s')
 
 	def normalize_y(self, vertex):
 		""" Substracts the globally lowest y coordinate (self.start_bottom_vertex) from another vertex 
@@ -154,50 +221,53 @@ class Scanner(object):
 		"""
 		return Vertex(vertex.x, vertex.y-self.start_bottom_vertex.y, vertex.z)
 
+	def closest_vertex_y(self, y, frame):
+		""" Finds vertex in frame the y coordinate of which is closest to y """
+
+		'Find rightmost value less than or equal to x'
+		return max(0, bisect_right([v.y for v in frame], y)-1)
+
 	def save_image(self):
 		f = open('output.obj', 'w')
 		print "writing to file"
-		vertex_index = 3 # Starts at 1, plus bottom center and top center points
-		vertex_indices = []
-		frame_index = 0
-		num_frames = len(self.processed_frames)
-		vertex_indices = []
 
 		# Write bottom center and top center points
 		f.write('v %s %s %s\n' % self.normalize_y(self.start_bottom_vertex).to_tuple())
 		f.write('v %s %s %s\n' % self.normalize_y(self.start_top_vertex).to_tuple())
 
 		for frame in self.processed_frames:
-			vertex_indices.append([])
 			for vertex in frame:
 				f.write('v %s %s %s\n' % self.normalize_y(vertex).to_tuple())
-				vertex_indices[frame_index].append(vertex_index)
-				vertex_index += 1
-			frame_index += 1
 
-		frame_index = 0
 		for frame in self.processed_frames:
-			if frame_index > num_frames - 1:
-				break
-			vertex_index = 0
-			num_vertices = len(frame)
+			next_frame = self.processed_frames.next_frame()
+
 			for vertex in frame:
-				next_frame = (frame_index + 1) % num_frames
-				v1 = vertex_indices[frame_index][vertex_index]
-				v3 = vertex_indices[next_frame][vertex_index]
-				if vertex_index == 0:
-					v2 = 1
+				v1 = vertex.index
+				if frame.current_vertex_index == 0:
+					v2 = next_frame[0].index
+					v3 = 1
 					f.write('f %s %s %s\n' % (v1, v2, v3))
 
-				if vertex_index == num_vertices - 1:
+				if frame.current_vertex_index == frame.num_vertices - 1:
+					# If the next frame has more vertices, insert faces from current frame's last vertex to them
+					if frame.num_vertices < next_frame.num_vertices:
+						for extra_vertex in range(frame.num_vertices-1, next_frame.num_vertices-1):
+							v2 = next_frame[extra_vertex+1].index
+							v3 = next_frame[extra_vertex].index
+							f.write('f %s %s %s\n' % (v1, v2, v3))
 					v2 = 2
+					v3 = next_frame[-1].index
 					f.write('f %s %s %s\n' % (v1, v2, v3))
 				else:
-					v2 = vertex_indices[frame_index][vertex_index + 1]
-					v4 = vertex_indices[next_frame][vertex_index + 1]
-					f.write('f %s %s %s %s\n' % (v1, v2, v4, v3))
-				vertex_index += 1
-			frame_index += 1
+					v2 = frame.next_vertex().index
+					v3 = next_frame.get_vertex(frame.current_vertex_index + 1, or_last=True).index
+					v4 = next_frame.get_vertex(frame.current_vertex_index, or_last=True).index
+					if v3 == v4:
+						f.write('f %s %s %s\n' % (v1, v2, v3))
+					else:
+						f.write('f %s %s %s %s\n' % (v1, v2, v3, v4))
+						
 		print "done writing"
 		f.close()
 
@@ -223,5 +293,5 @@ class Scanner(object):
 			frame += 1
 
 
-scanner = Scanner()
+scanner = Scanner(detection='red')
 scanner.loop()
