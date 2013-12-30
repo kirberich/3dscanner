@@ -23,13 +23,22 @@ class Scanner(object):
             frames_per_step=1,
             camera_index=0, 
             scale=.1, 
-            view_angle_y=0.785
+            view_angle_y=0.785,
+            fill_holes=True,
+            make_faces=True
             ):
+
         self.calibration = None
         self.area = None
         self.mode = None
         self.keep_running = True
         self.frames_per_step = frames_per_step
+
+        if not fill_holes and make_faces:
+            raise Exception("Creating faces on model but not filling holes in scan data is not supported.")
+
+        self.fill_holes = fill_holes
+        self.make_faces = make_faces
 
         self.zero_x = None
         self.rotation_angle = 0
@@ -193,7 +202,7 @@ class Scanner(object):
 
             # If some (image) y coordinates didn't contain any data, interpolate their values
             # FIXME: This is quite naive, it doesn't allow for holes or other complex geometries
-            if last_point and last_point[0] < img_y - 1:
+            if self.fill_holes and last_point and last_point[0] < img_y - 1:
                 d_img_y = last_point[0] + 1
                 total_diff = img_y - last_point[0]
                 while d_img_y < img_y:
@@ -229,7 +238,7 @@ class Scanner(object):
 
     def rotate(self):
         self.rotation_angle += self.rotation_step
-        print self.send_command('s')
+        self.send_command('s')
 
     def normalize_y(self, vertex):
         """ Substracts the globally lowest y coordinate (self.start_bottom_vertex) from another vertex 
@@ -245,7 +254,7 @@ class Scanner(object):
 
     def save_image(self):
         f = open('output.obj', 'w')
-        print "writing to file"
+        print "writing to file..."
 
         # Write bottom center and top center points
         f.write('v %s %s %s\n' % self.normalize_y(self.start_bottom_vertex).to_tuple())
@@ -254,6 +263,13 @@ class Scanner(object):
         for frame in self.processed_frames:
             for vertex in frame:
                 f.write('v %s %s %s\n' % self.normalize_y(vertex).to_tuple())
+
+        if not self.make_faces:
+            print "Finished writing vertices, not creating faces on model."
+            f.close()
+            return
+        else:
+            print "Finished writing vertices, creating faces..."
 
         for frame in self.processed_frames:
             next_frame = self.processed_frames.next_frame()
@@ -284,7 +300,7 @@ class Scanner(object):
                     else:
                         f.write('f %s %s %s %s\n' % (v1, v2, v3, v4))
                         
-        print "done writing"
+        print "Finished writing faces."
         f.close()
 
     def loop(self):
