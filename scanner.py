@@ -15,11 +15,21 @@ DEBUG = True
 
 
 class Scanner(object):
-    def __init__(self, laser_threshold=200, detection='white', rotation_step=0.00314159265*40, camera_index=0, scale=.1, view_angle_y=0.785):
+    def __init__(
+            self, 
+            laser_threshold=50, 
+            detection='white', 
+            rotation_step=2*math.pi/200,
+            frames_per_step=1,
+            camera_index=0, 
+            scale=.1, 
+            view_angle_y=0.785
+            ):
         self.calibration = None
         self.area = None
         self.mode = None
         self.keep_running = True
+        self.frames_per_step = frames_per_step
 
         self.zero_x = None
         self.rotation_angle = 0
@@ -98,9 +108,15 @@ class Scanner(object):
         elif k == 105: # 'i' for info
             print self.send_command('d')
 
+    def _capture_frame(self):
+        #return cv2.imread("sketch1_laser.png")
+        return self.capture.read()[1]
+
     def record_frame(self):
-        self.frame = cv2.imread("sketch1_laser.png")
-        #self.frame = self.capture.read()[1]
+        self.frame = self._capture_frame()/self.frames_per_step
+        for i in range(1, self.frames_per_step):
+            self.frame = self.frame + self._capture_frame()/self.frames_per_step
+
         self.display_image = self.frame
 
         blue, green, red = cv2.split(self.frame)
@@ -293,5 +309,5 @@ class Scanner(object):
             frame += 1
 
 
-scanner = Scanner(detection='red')
+scanner = Scanner(detection='white', frames_per_step=5)
 scanner.loop()
