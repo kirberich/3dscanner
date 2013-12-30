@@ -50,6 +50,7 @@ class Scanner(object):
         self.view_angle_y = view_angle_y
 
         self.frame = None
+        self.frame_diff = None
         self.last_raw_points = None
         self.laser_threshold = laser_threshold
         self.thresholded = None
@@ -83,6 +84,11 @@ class Scanner(object):
         retval.append(self.ser.readline().strip())
         while self.ser.inWaiting():
             retval.append(self.ser.readline().strip())
+
+        if retval == ['true']:
+            return True 
+        if retval == ['false']:
+            return False
         return retval
 
     def calibrate(self, x=None):
@@ -117,24 +123,47 @@ class Scanner(object):
         elif k == 105: # 'i' for info
             print self.send_command('d')
 
-    def _capture_frame(self):
-        #return cv2.imread("sketch1_laser.png")
+    def _capture_frame(self, laser=True):
+        """ Capture a new frame, turning on/off the laser before the capture. """
+        if laser:
+            return cv2.imread("sketch1_laser.png")
+        return cv2.imread("sketch1.png")
+
+        command_retval = None
+        while command_retval != laser:
+            command_retval = self.send_command('L' if laser else 'l')
+            if DEBUG: 
+                print 'setting laser state'
+
         return self.capture.read()[1]
 
     def record_frame(self):
-        self.frame = self._capture_frame()/self.frames_per_step
-        for i in range(1, self.frames_per_step):
-            self.frame = self.frame + self._capture_frame()/self.frames_per_step
+        self.frame = self._capture_frame(laser=True)/self.frames_per_step
 
+        if self.mode != 'scan':
+            self.display_image = self.frame
+            return
+
+        for i in range(1, self.frames_per_step):
+            self.frame = self.frame + self._capture_frame(laser=True)/self.frames_per_step
         self.display_image = self.frame
 
-        blue, green, red = cv2.split(self.frame)
-        if self.detection == 'red':
-            red = red - cv2.min(red, blue)
-            red = red - cv2.min(red, green)
-            to_threshold = red
-        else:
+        if self.detection == 'diff':
+            frame_no_laser = self._capture_frame(laser=False)/self.frames_per_step
+            for i in range(1, self.frames_per_step):
+                frame_no_laser = frame_no_laser + self._capture_frame(laser=False)/self.frames_per_step
+
+            self.frame_diff = cv2.absdiff(self.frame, frame_no_laser)
+            blue, green, red = cv2.split(self.frame_diff) 
             to_threshold = blue/3+green/3+red/3
+        else:
+            blue, green, red = cv2.split(self.frame)
+            if self.detection == 'red':
+                red = red - cv2.min(red, blue)
+                red = red - cv2.min(red, green)
+                to_threshold = red
+            else:
+                to_threshold = blue/3+green/3+red/3
 
         retval, self.thresholded = cv2.threshold(to_threshold, self.laser_threshold, 255, cv2.THRESH_BINARY)
 

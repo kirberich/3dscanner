@@ -1,3 +1,4 @@
+int laserPin = 3;
 int enablePin = 4;
 int MS1Pin = 5;
 int MS2Pin = 6;
@@ -20,6 +21,7 @@ int[] stepping = {
 int motorStep = 0;
 int maxStep = 200;
 int minimumStepDelay = 2;
+int laserState = false;
 
 String motorState = String("off");
 
@@ -42,6 +44,7 @@ void resetMotor() {
 void setup()  { 
   pinMode(switchPin, INPUT);
   pinMode(motorPin, OUTPUT);
+  pinMode(laserPin, OUTPUT);
   digitalWrite(switchPin, HIGH); 
   
   Serial.begin(9600);
@@ -53,6 +56,7 @@ void loop()  {
     switch (command) {
       case 'd':
         Serial.println(String("Current step: ") + motorStep);
+        Serial.println(String("Laser status: ") + laserState);
         break;
       case 's':
         makeStep();
@@ -61,6 +65,15 @@ void loop()  {
       case 'r':
         resetMotor();
         Serial.println(String("Motor reset. (Step is ") + motorStep + String(")"));
+        break;
+      case 'l':
+        laserState = false;
+        digitalWrite(laserPin, laserState);
+        break;
+      case 'L':
+        laserState = true;
+        digitalWrite(laserPin, laserState);
+        break;
     }
   }
 }

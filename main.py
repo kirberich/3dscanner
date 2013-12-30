@@ -3,7 +3,7 @@ import settings
 
 scanner = Scanner(
 	camera_index=settings.CAMERA_INDEX,
-	view_angle_y=settings.view_angle_y,
+	view_angle_y=settings.VIEW_ANGLE_Y,
 	laser_threshold=settings.LASER_THRESHOLD,
 	detection=settings.DETECTION,
 	rotation_step=settings.ROTATION_STEP,
