@@ -1,5 +1,22 @@
-int motorPin = 9;
-int switchPin = 7;
+int enablePin = 4;
+int MS1Pin = 5;
+int MS2Pin = 6;
+int MS3Pin = 7;
+int resetPin = 9;
+int sleepPin = 10;
+int motorPin = 11;
+int directionPin = 12;
+int switchPin = 13;
+
+// Stepping: Full, half, quarter, eigth, sixteenth
+int[] stepping = {
+  B000,
+  B100,
+  B010, 
+  B110, 
+  B111
+}
+
 int motorStep = 0;
 int maxStep = 200;
 int minimumStepDelay = 2;
