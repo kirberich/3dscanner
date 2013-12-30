@@ -18,7 +18,7 @@ class Scanner(object):
     def __init__(
             self, 
             laser_threshold=50, 
-            detection='white', 
+            detection='brightness', 
             rotation_step=2*math.pi/200,
             frames_per_step=1,
             camera_index=0, 
@@ -323,7 +323,3 @@ class Scanner(object):
                     self.rotate()
             self.display_frame()
             frame += 1
-
-
-scanner = Scanner(detection='white', frames_per_step=5)
-scanner.loop()
