@@ -5,8 +5,8 @@ class Box(object):
     def __init__(self, x1=None, y1=None, x2=None, y2=None):
         self.x1 = x1
         self.y1 = y1
-        self.x2 = x2 
-        self.y2 = y2    
+        self.x2 = x2
+        self.y2 = y2
 
     def to_tuple(self):
         return (self.x1, self.y1, self.x2, self.y2)
@@ -24,6 +24,18 @@ class Vertex(object):
 
     def to_tuple(self):
         return (self.x, self.y, self.z)
+
+    def __add__(self, other):
+        self.x += other.x
+        self.y += other.y
+        self.z += other.z
+        return self
+
+    def __div__(self, number):
+        self.x /= number
+        self.y /= number
+        self.z /= number
+        return self
 
 
 class Frame(object):
@@ -45,6 +57,44 @@ class Frame(object):
         for vertex in self._vertices:
             yield vertex
             self.current_vertex_index += 1
+
+    def average(self, max_y_diff):
+        """ Averages any points that have a y-distances of less than max_y_diff.
+            The y distance is used because the frame's vertices are sorted by y """
+        new_vertices = []
+        sum_vertex = Vertex()
+        average_count = 0
+        vertex_index = 0
+        last_vertex = Vertex()
+
+
+        for vertex in self._vertices:
+            if abs(vertex.y - last_vertex.y) < max_y_diff:
+                sum_vertex += vertex
+                average_count += 1
+            else:
+                if average_count:
+                    sum_vertex /= average_count
+                    sum_vertex.index = vertex_index
+                    new_vertices.append(sum_vertex)
+                else:
+                    vertex.index = vertex_index
+                    new_vertices.append(vertex)
+
+                sum_vertex = Vertex()
+                average_count = 0
+                vertex_index += 1
+            last_vertex = vertex
+
+        if average_count:
+            sum_vertex /= average_count
+            sum_vertex.index = vertex_index
+            new_vertices.append(sum_vertex)
+            vertex_index += 1
+
+        self._vertices = new_vertices
+        self.num_vertices = vertex_index + 1
+        self.current_vertex_index = vertex_index
 
     @property
     def next_vertex_index(self):
@@ -76,11 +126,11 @@ class Frame(object):
 
 
 class Scan(object):
-    def __init__(self, vertex_index=1):
+    def __init__(self):
         self._frames = []
         self.num_frames = 0
         self.current_frame_index = 0
-        self.vertex_index = vertex_index
+        self.vertex_index = 1
 
     def __getitem__(self, index):
         return self._frames[index]
