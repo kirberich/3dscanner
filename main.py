@@ -1,15 +1,14 @@
+import sys
+
 from scanner import Scanner
 import settings
 
 scanner = Scanner(
-	camera_index=settings.CAMERA_INDEX,
-	view_angle_y=settings.VIEW_ANGLE_Y,
-	laser_threshold=settings.LASER_THRESHOLD,
-	detection=settings.DETECTION,
-	rotation_step=settings.ROTATION_STEP,
-	frames_per_step=settings.FRAMES_PER_STEP,
-	scale=settings.SCALE,
-	fill_holes=settings.FILL_HOLES,
-	make_faces=settings.MAKE_FACES
-	)
+    camera_index=settings.CAMERA_INDEX,
+    fov=settings.FOV,
+    laser_threshold=settings.LASER_THRESHOLD,
+    rotation_step=settings.ROTATION_STEP,
+    scale=settings.SCALE,
+    device=sys.argv[1]
+)
 scanner.loop()

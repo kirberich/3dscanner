@@ -1,67 +1,68 @@
 import time
 import numpy
+from numpy import array
 import math
 import random
 import copy
 import serial
+from datetime import datetime, timedelta
 from bisect import bisect_right
 
 import cv, cv2
 
-from structs import Box, Vertex, Frame, Scan
+from models import Vertex, Frame, Scan, Box
+from utils import rotate
 
 SQRT_2 = math.sqrt(2.0)
 DEBUG = True
 
 
+def debug(message):
+    if DEBUG:
+        print message
+
 class Scanner(object):
     def __init__(
-            self, 
-            laser_threshold=50, 
-            detection='brightness', 
-            rotation_step=2*math.pi/200,
-            frames_per_step=1,
-            camera_index=0, 
-            scale=.1, 
-            view_angle_y=0.785,
-            fill_holes=True,
-            make_faces=True
+                self,
+                device,
+                laser_threshold=50,
+                rotation_step=2*math.pi/200,
+                camera_index=0,
+                scale=10.0,
+                fov=1.047,
+                format_ratio=1.7777
             ):
 
-        self.calibration = None
+        self.device = device
+
         self.area = None
         self.mode = None
         self.keep_running = True
-        self.frames_per_step = frames_per_step
 
-        if not fill_holes and make_faces:
-            raise Exception("Creating faces on model but not filling holes in scan data is not supported.")
-
-        self.fill_holes = fill_holes
-        self.make_faces = make_faces
-
-        self.zero_x = None
+        self.platform_middle = None
         self.rotation_angle = 0
         self.rotation_step = rotation_step
 
         self.width = None
         self.height = None
         self.scale = scale
-        self.view_angle_y = view_angle_y
+        self.fov = fov
+        self.format_ratio = format_ratio
+        self.fov_x = format_ratio*fov/math.sqrt(1+format_ratio**2)
+        self.fov_y = fov/math.sqrt(1+format_ratio**2)
+        # FIXME: This should be calibrated, not hardcoded
+        # To be able to calculate the camera position, we need the camera angle and (for example) the size of the platform
+        # m = rotate(array([1, 0, 0]), numpy.array([0, 1, 0]), camera_angle) # Straight ahead rotated by camera angle
+        self.camera_position = array([0, -0.3, 0.15])
 
-        self.frame = None
-        self.frame_diff = None
         self.last_raw_points = None
         self.laser_threshold = laser_threshold
-        self.thresholded = None
-        self.detection = detection
+        self.is_laser_on = False
         self.display_image = None
 
-        # Start numbering vertices at 3, to allow for the bottom and top center points
-        self.processed_frames = Scan(vertex_index=3)
-        self.start_bottom_vertex = Vertex(0, 99999, 0)
-        self.start_top_vertex = Vertex(0, -99999, 0)
+        self.processed_frames = Scan()
 
+        self.ui_messages = []
         self.capture = cv2.VideoCapture(camera_index)
         self.window_name = "ui"
         cv2.namedWindow(self.window_name)
@@ -69,211 +70,216 @@ class Scanner(object):
 
         # Arduino connection
         try:
-            self.ser = serial.Serial('/dev/tty.usbmodem1411', 9600, timeout=1)
+            self.ser = serial.Serial(device, 9600, timeout=1)
         except OSError:
             print "Couldn't establish serial connection"
             self.ser = None
 
-    def send_command(self, command):
+    def send_command(self, command, wait_for_reply=False):
         """ Send serial command to arduino """
         if not self.ser:
-            return []
+            return
 
-        retval = []
         self.ser.write(command)
-        retval.append(self.ser.readline().strip())
-        while self.ser.inWaiting():
-            retval.append(self.ser.readline().strip())
-
-        if retval == ['true']:
-            return True 
-        if retval == ['false']:
-            return False
-        return retval
+        if wait_for_reply:
+            self.ser.readline().strip()
 
     def calibrate(self, x=None):
-        self.record_frame()
-        self.height, self.width, channels = self.frame.shape
-
-        self.zero_x = x or self.width/2
-        self.calibration = Box(x1=self.zero_x, y1=0, x2=self.zero_x, y2=self.height)
+        frame = self.capture_diff()
+        self.height, self.width, channels = frame.shape
 
     def handle_mouse(self, e, x, y, flags, param):
-        if e == cv2.EVENT_LBUTTONDOWN:
-            if self.mode == 'calibrate':
-                self.calibrate(x)
-            elif self.mode == 'box':
+        if self.mode == 'set_middle':
+            if e == cv2.EVENT_LBUTTONDOWN:
+                self.platform_middle = (x, y)
+                self.mode = None
+        else:
+            if e == cv2.EVENT_LBUTTONDOWN:
                 self.area = Box(x, y, None, None)
-        elif e == cv2.EVENT_LBUTTONUP:
-            if self.mode == 'box':
-                self.area.x2 = min(self.zero_x, x) or x
+            elif e == cv2.EVENT_LBUTTONUP:
+                self.area.x2 = x
                 self.area.y2 = y
-            self.mode = None
+
+    def add_message(self, message):
+        if len(self.ui_messages) >= 5:
+            self.ui_messages = self.ui_messages[-5:]
+        self.ui_messages.append((datetime.now(), message))
+
+    def clear_old_messages(self):
+        new_messages = []
+        now = datetime.now()
+        max_delta = timedelta(seconds=5)
+        for (timestamp, message) in self.ui_messages:
+            if now - timestamp < max_delta:
+                new_messages.append((timestamp, message))
+        self.ui_messages = new_messages
 
     def handle_keyboard(self):
         k = cv2.waitKey(1) & 0xFF
-        if k == 99:
-            self.mode = 'calibrate'
-        elif k == 98: # 'b' for box
-            self.mode = 'box'
-        elif k == 115: # 's' for scan
+        if k == 115: # 's' for scan
+            if not self.platform_middle:
+                self.add_message('Please set platform middle before scanning (press m and click)')
+                return
+            # Enable motors to avoid a delay on the first step
+            self.send_command('M')
+            time.sleep(0.5)
             self.mode = 'scan'
         elif k == 27:
-            self.keep_running = False
+            if self.mode == 'scan':
+                self.mode = 'stop_scan'
+            else:
+                self.keep_running = False
         elif k == 105: # 'i' for info
             print self.send_command('d')
+        elif k == 108:
+            self.set_laser(not self.is_laser_on)
+        elif k == 109: # 'm' to set platform middle
+            self.mode = 'set_middle'
 
-    def _capture_frame(self, laser=True):
-        """ Capture a new frame, turning on/off the laser before the capture. """
-        if laser:
-            return cv2.imread("sketch1_laser.png")
-        return cv2.imread("sketch1.png")
-
-        command_retval = None
-        while command_retval != laser:
-            command_retval = self.send_command('L' if laser else 'l')
-            if DEBUG: 
-                print 'setting laser state'
-
+    def _capture_frame(self):
+        # if self.is_laser_on:
+        #     return cv2.imread("sketch1_laser.png")
+        # return cv2.imread("sketch1.png")
         return self.capture.read()[1]
 
-    def record_frame(self):
-        self.frame = self._capture_frame(laser=True)/self.frames_per_step
+    def set_laser(self, is_on):
+        command = 'L' if is_on else 'l'
+        self.send_command(command)
+        self.is_laser_on = is_on
 
-        if self.mode != 'scan':
-            self.display_image = self.frame
-            return
+    def capture_diff(self, thresholded=False):
+        # Captures two frames, one with laser on and one with laser off
+        # Set thresholded to True to return the frame with self.laser_threshold applied
 
-        for i in range(1, self.frames_per_step):
-            self.frame = self.frame + self._capture_frame(laser=True)/self.frames_per_step
-        self.display_image = self.frame
+        lower_red = numpy.array([15,50,50])
+        upper_red = numpy.array([165,255,255])
 
-        if self.detection == 'diff':
-            frame_no_laser = self._capture_frame(laser=False)/self.frames_per_step
-            for i in range(1, self.frames_per_step):
-                frame_no_laser = frame_no_laser + self._capture_frame(laser=False)/self.frames_per_step
+        # Threshold the HSV image to get only red colors
 
-            self.frame_diff = cv2.absdiff(self.frame, frame_no_laser)
-            blue, green, red = cv2.split(self.frame_diff) 
-            to_threshold = blue/3+green/3+red/3
-        else:
-            blue, green, red = cv2.split(self.frame)
-            if self.detection == 'red':
-                red = red - cv2.min(red, blue)
-                red = red - cv2.min(red, green)
-                to_threshold = red
-            else:
-                to_threshold = blue/3+green/3+red/3
 
-        retval, self.thresholded = cv2.threshold(to_threshold, self.laser_threshold, 255, cv2.THRESH_BINARY)
+        # Capture frame with laser on
+        self.set_laser(True)
+        time.sleep(0.2)
+        frame = self._capture_frame()
 
-    def process_frame(self):
-        area = self.thresholded[self.area.y1:self.area.y2, self.area.x1:self.area.x2] if self.area else self.thresholded
 
-        if DEBUG:
-            cv2.namedWindow("test")
-            cv2.imshow("test", area)
+
+        # Set frame with laser to be displayed
+
+        # Capture frame with laser off
+        self.set_laser(False)
+        time.sleep(0.2)
+        frame_no_laser = self._capture_frame()
+
+        frame_diff = self.red_filter(cv2.absdiff(frame, frame_no_laser))
+        self.display_image = frame_diff
+        if not thresholded:
+            return frame_diff
+
+        blue, green, red = cv2.split(frame_diff)
+        retval, thresholded = cv2.threshold(red, self.laser_threshold, 255, cv2.THRESH_BINARY)
+        return thresholded
+
+    def get_laser_plane_intersection(self, v):
+        """ Calculates the intersection of a vector with the laser plane.
+            The camera position is represented by the vector [0, c_y, c_z], where c_y and c_z are the camera coordinates.
+            c_y should be negative, as the y axis is positive away from the camera, starting at the platform middle.
+            The plane is represented by the plane created by the vectors [1,1,0] and [0,0,1]
+        """
+        c_y, c_z = self.camera_position[1:3]
+        x, y, z = v[:3]
+        lam = c_y/(x-y)
+
+        return array([
+            lam*x,
+            lam*y + c_y,
+            lam*z + c_z
+        ])
+        return v + array([0, ])
+
+    def process_frame(self, thresholded_frame):
+        if self.area and self.area.is_complete:
+            thresholded_frame = thresholded_frame[self.area.y1:self.area.y2, self.area.x1:self.area.x2]
 
         processed_frame = Frame()
-        points = numpy.transpose(area.nonzero())
+        points = numpy.transpose(thresholded_frame.nonzero())
 
-        # Test empty frames
-        # if random.random() < 0.05:
-        #   points = []
+        if not len(points):
+            return
 
-        # If a frame is completely empty, use the last one
-        # FIXME: This is at least bad because it doesn't interpolate between frames before and after a gap
-        # But because this is happening online, the frames after the gap aren't known yet, so it stays like this for now
-        if len(points) < 2:
-            if self.last_raw_points is not None:
-                points = self.last_raw_points
-            else:
-                print "no data in first frame(s)!"
-                return
+        # Precalculations
+        tan_half_fov_x = math.tan(self.fov_x/2)
+        tan_half_fov_y = math.tan(self.fov_y/2)
 
-        self.last_raw_points = points
-        row = points[0][0]
-        row_medians = {row:0}
-        num_row_points = {row:0}
+        # m is the vector from the camera position to the origin
+        m = self.camera_position * -1
+        w = self.width/2
+        h = self.height/2
 
-        for y, x in points:
-            row_medians[y] = row_medians.setdefault(y, 0) + x
-            num_row_points[y] = num_row_points.setdefault(y, 0) + 1
-
-        last_point = None
-        last_vertex = None
-
-        row_median_list = sorted(row_medians.items(), key = lambda p: p[0])
-        for point in row_median_list:
-            # Test frames with different amounts of vertices
-            # if random.random() < 0.05:
-            #   continue
+        for point in points:
             img_y, img_x = point
-            # Average division for x coordinates in row happening here to save a loop
-            img_x = float(img_x)/num_row_points[img_y] 
 
-            if self.area:
+            if self.area and self.area.is_complete:
                 img_y += self.area.y1
                 img_x += self.area.x1
 
-            # horizontal distance from middle of frame (and therefore middle of object)
-            delta_x = float(self.zero_x) - img_x
-            d = SQRT_2*delta_x
+            # Horizontal angle between platform middle (in image) and point
+            delta_x = float(img_x - self.platform_middle[0])/2
+            tau = math.atan(delta_x/w*tan_half_fov_x)
 
-            # vertical angle to point from middle of frame
-            half_height = float(self.height)/2
-            y_from_middle = img_y - half_height
-            alpha = math.atan((y_from_middle/half_height) * self.view_angle_y/2)
+            # Vertical angle
+            delta_y = float(img_y - self.platform_middle[1])/2
+            rho = math.atan(delta_y/h*tan_half_fov_y)
 
-            x = math.cos(self.rotation_angle) * d * self.scale
-            y = self.height - math.sin(alpha)/math.sin(self.view_angle_y/2) * half_height * self.scale
-            z = math.sin(self.rotation_angle) * d * self.scale
+            # Rotate vector m around tau and rho to point towards 'point'
+            v = m
+            v = rotate('z', v, tau) # Rotate around z axis for horizontal angle
+            v = rotate('x', v, rho) # Rotate around x axis for vertical angle
 
-            # If some (image) y coordinates didn't contain any data, interpolate their values
-            # FIXME: This is quite naive, it doesn't allow for holes or other complex geometries
-            if self.fill_holes and last_point and last_point[0] < img_y - 1:
-                d_img_y = last_point[0] + 1
-                total_diff = img_y - last_point[0]
-                while d_img_y < img_y:
-                    dx = (float(img_y - d_img_y)/total_diff) * last_vertex.x + (float(d_img_y-last_point[0])/total_diff) * x
-                    dy = (float(img_y - d_img_y)/total_diff) * last_vertex.y + (float(d_img_y-last_point[0])/total_diff) * y
-                    dz = (float(img_y - d_img_y)/total_diff) * last_vertex.z + (float(d_img_y-last_point[0])/total_diff) * z
-                    processed_frame.append(Vertex(dx, dy, dz))
-                    d_img_y += 1
+            v = self.get_laser_plane_intersection(v)
+
+            # Ignore any vertices that have negative z coordinates (pre scaling)
+            if v[2] < 0:
+                continue
+
+            x,y,z = v*self.scale
+            x,y,z = rotate('z', v, self.rotation_angle)
 
             vertex = Vertex(x, y, z)
             processed_frame.append(vertex)
-            last_point = img_y, img_x
-            last_vertex = vertex
 
         self.processed_frames.append(processed_frame)
 
-        # Update top and bottom center points
-        if processed_frame[0].y < self.start_bottom_vertex.y:
-            self.start_bottom_vertex = Vertex(0, processed_frame[0].y, 0)
-        if processed_frame[-1].y > self.start_top_vertex.y:
-            self.start_top_vertex = Vertex(0, processed_frame[-1].y, 0)
+    def show_frame(self):
+        cv2.line(self.display_image, (self.width/2, 0), (self.width/2, self.height), (255, 255, 255))
+        cv2.line(self.display_image, (0, self.height/2), (self.width, self.height/2), (255, 255, 255))
 
-    def display_frame(self):
-        if self.calibration:
-            x1, y1, x2, y2 = [int(c) for c in self.calibration.to_tuple()]
-            cv2.rectangle(self.display_image, (x1, y1), (x2, y2), (100, 255, 0))
+        if self.platform_middle:
+            cv2.line(
+                self.display_image,
+                (self.platform_middle[0]-10, self.platform_middle[1]),
+                (self.platform_middle[0]+10, self.platform_middle[1]),
+                (255, 0, 0)
+            )
+            cv2.line(
+                self.display_image,
+                (self.platform_middle[0], self.platform_middle[1]-10),
+                (self.platform_middle[0], self.platform_middle[1]+10),
+                (255, 0, 0)
+            )
 
         if self.area and self.area.is_complete():
             x1, y1, x2, y2 = [int(c) for c in self.area.to_tuple()]
             cv2.rectangle(self.display_image, (x1, y1), (x2, y2), (255, 100, 0))
+
+        for index, (timestamp, message) in enumerate(self.ui_messages):
+            cv2.putText(self.display_image, message, (10, self.height-10-15*index), cv2.FONT_HERSHEY_COMPLEX_SMALL, 0.8, (255, 255, 255))
 
         cv2.imshow(self.window_name, self.display_image)
 
     def rotate(self):
         self.rotation_angle += self.rotation_step
         self.send_command('s')
-
-    def normalize_y(self, vertex):
-        """ Substracts the globally lowest y coordinate (self.start_bottom_vertex) from another vertex 
-            to make the object touch the origin
-        """
-        return Vertex(vertex.x, vertex.y-self.start_bottom_vertex.y, vertex.z)
 
     def closest_vertex_y(self, y, frame):
         """ Finds vertex in frame the y coordinate of which is closest to y """
@@ -285,70 +291,59 @@ class Scanner(object):
         f = open('output.obj', 'w')
         print "writing to file..."
 
-        # Write bottom center and top center points
-        f.write('v %s %s %s\n' % self.normalize_y(self.start_bottom_vertex).to_tuple())
-        f.write('v %s %s %s\n' % self.normalize_y(self.start_top_vertex).to_tuple())
-
         for frame in self.processed_frames:
             for vertex in frame:
-                f.write('v %s %s %s\n' % self.normalize_y(vertex).to_tuple())
+                f.write('v %s %s %s\n' % vertex.to_tuple())
 
-        if not self.make_faces:
-            print "Finished writing vertices, not creating faces on model."
-            f.close()
-            return
-        else:
-            print "Finished writing vertices, creating faces..."
-
-        for frame in self.processed_frames:
-            next_frame = self.processed_frames.next_frame()
-
-            for vertex in frame:
-                v1 = vertex.index
-                if frame.current_vertex_index == 0:
-                    v2 = next_frame[0].index
-                    v3 = 1
-                    f.write('f %s %s %s\n' % (v1, v2, v3))
-
-                if frame.current_vertex_index == frame.num_vertices - 1:
-                    # If the next frame has more vertices, insert faces from current frame's last vertex to them
-                    if frame.num_vertices < next_frame.num_vertices:
-                        for extra_vertex in range(frame.num_vertices-1, next_frame.num_vertices-1):
-                            v2 = next_frame[extra_vertex+1].index
-                            v3 = next_frame[extra_vertex].index
-                            f.write('f %s %s %s\n' % (v1, v2, v3))
-                    v2 = 2
-                    v3 = next_frame[-1].index
-                    f.write('f %s %s %s\n' % (v1, v2, v3))
-                else:
-                    v2 = frame.next_vertex().index
-                    v3 = next_frame.get_vertex(frame.current_vertex_index + 1, or_last=True).index
-                    v4 = next_frame.get_vertex(frame.current_vertex_index, or_last=True).index
-                    if v3 == v4:
-                        f.write('f %s %s %s\n' % (v1, v2, v3))
-                    else:
-                        f.write('f %s %s %s %s\n' % (v1, v2, v3, v4))
-                        
-        print "Finished writing faces."
         f.close()
+        self.processed_frames = []
+        print "Done writing output file."
+
+    def red_filter(self, image):
+        begin_lower_border = numpy.array([0, 50, 20])
+        begin_upper_border = numpy.array([35, 255, 255])
+
+        end_lower_border = numpy.array([145, 50, 20])
+        end_upper_border = numpy.array([180, 255, 255])
+
+        white_lower_border = numpy.array([0, 0, 180])
+        white_upper_border = numpy.array([180, 255, 255])
+
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        mask1 = cv2.inRange(image, begin_lower_border, begin_upper_border)
+        mask2 = cv2.inRange(image, end_lower_border, end_upper_border)
+        mask3 = cv2.inRange(image, white_lower_border, white_upper_border)
+        mask = cv2.bitwise_or(mask1, mask2)
+        mask = cv2.bitwise_or(mask, mask3)
+        image = cv2.bitwise_and(image, image, mask=mask)
+        image = cv2.cvtColor(image, cv2.COLOR_HSV2BGR)
+
+        return image
 
     def loop(self):
         frame = 0
-        self.record_frame()
         self.calibrate()
 
         while self.keep_running:
             self.handle_keyboard()
-            self.record_frame()
 
-            if self.mode == 'scan':
-                if self.rotation_angle > math.pi*2:
-                    self.mode = None
+            if self.mode == 'scan' or self.mode == 'stop_scan':
+                thresholded_frame = self.capture_diff(thresholded=True)
+                if self.rotation_angle > math.pi*2 or self.mode == 'stop_scan':
                     self.save_image()
-                else:
-                    self.process_frame()
-                    if frame % 100:
-                        print self.rotation_angle
-                    self.rotate()
-            self.display_frame()
+                    self.mode = None
+                    self.rotation_angle = 0
+                    self.set_laser(False)
+                    continue
+
+                self.process_frame(thresholded_frame)
+                if frame % 100:
+                    debug(self.rotation_angle)
+                self.rotate()
+                time.sleep(0.1)
+            else:
+                self.display_image = self._capture_frame()
+
+            self.clear_old_messages()
+            self.show_frame()
             frame += 1
